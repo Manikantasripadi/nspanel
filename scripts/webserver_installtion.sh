@@ -359,4 +359,4 @@ systemctl restart neoistone
 systemctl enable neoistone
 rm -rf ${runpath}/neoistone 
 rm -rf ${runpath}/neoistone.sh
-rm -rf ${runpath}/neoistone.tar.gz
+rm -rf ${runpath}/neoistone.zip
