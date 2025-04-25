@@ -1,0 +1,271 @@
+#!/bin/bash
+
+# Step 1: Get all IP addresses, excluding loopback addresses (127.x.x.x)
+ips=$(ip addr show | grep "inet " | awk '{print $2}' | cut -d'/' -f1 | grep -v "^127\.")
+
+# Print the IP addresses
+if [ -n "$ips" ]; then
+  echo "Local IP addresses:"
+  select ip in $ips; do
+    if [[ -n "$ip" ]]; then
+      break
+    else
+      echo "Invalid selection. Try again."
+    fi
+  done
+else
+  echo "No local IP addresses found."
+  exit 1
+fi
+
+zone_dir="/var/named"
+named_conf="/etc/named.conf"
+public_ip=$(curl -s --interface "$ip" https://api.ipify.org)
+
+echo "You selected: $ip -> $public_ip"
+
+
+# Step 2: Get USERNAME and DOMAIN from the user
+read -p "Enter system username (used for web dir): " username
+read -p "Enter domain name (e.g. example.com): " domain
+
+# Step 3: Check if the domain already exists
+if ! [[ "$domain" =~ ^([a-zA-Z0-9]+(-[a-zA-Z0-9]+)*\.)+[a-zA-Z]{2,}$ ]]; then
+    echo "❌ Invalid domain format. Aborting..."
+    exit 1
+fi
+
+if [ -f "/etc/nginx/conf.d/${domain}.conf" ]; then
+    echo "❌ Error: Domain '$domain' already has a configuration file. Aborting..."
+    exit 1
+fi
+
+if [ -f ${zone_dir}/${domain}.db ]; then
+    echo "❌ Error: Domain '$domain' already has a configuration file. Aborting..."
+    exit 1
+fi
+
+#Step 4: Check Cerbot if the already installed
+if [ ! -f "/usr/bin/certbot" ]; then
+    echo "Installing Certbot"
+    dnf install -y certbot python3 python3-certbot-nginx
+fi
+
+# Step 5: Select PHP version
+echo "Select PHP version:"
+select phpver in "81" "82" "83" "84"; do
+    [[ "$phpver" =~ ^8[1-4]$ ]] && break
+    echo "Invalid version. Try again."
+done
+
+# Step 6: SSL option
+echo "Choose SSL option:"
+select ssl_option in "Self-Signed" "Certbot (Let's Encrypt)"; do
+    [[ "$ssl_option" == "Self-Signed" || "$ssl_option" == "Certbot (Let's Encrypt)" ]] && break
+    echo "Invalid option. Try again."
+done
+
+# Step 7: Creating Directories
+
+if id "$username" &>/dev/null; then
+    mkdir "/var/www/${username}/domains/${domain}"
+    mkdir "/var/www/${username}/domains/${domain}/cgi-bin"
+    echo "" > "/var/www/${username}/domains/${domain}/index.html"
+    root="/var/www/${username}/domains/${domain}"
+else
+    echo "🔧 Creating user and web dirs with webuser..."
+    useradd -m -d /var/www/$username $username
+    mkdir "/var/www/${username}/public_html"
+    mkdir "/var/www/${username}/public_html/cgi-bin"
+    mkdir "/var/www/${username}/ssl";
+    mkdir "/var/www/${username}/logs";
+    mkdir "/var/www/${username}/tmp";
+    mkdir "/var/www/${username}/domains";
+    mkdir "/usr/local/nspanel/accounts/${username}"
+    mkdir "/usr/local/nspanel/accounts/${username}/domains"
+    root="/var/www/${username}/public_html"
+fi
+
+chown -R $username:$username "/var/www/${username}"
+chmod -R 0755 "/var/www/${username}"
+
+# Paths
+ssl_dir="/var/www/${username}/ssl"
+log_dir="/var/www/${username}/logs"
+conf_file="/etc/nginx/conf.d/${domain}.conf"
+fpm_file="/etc/opt/remi/php${phpver}/php-fpm.d/${domain}_${username}.conf";
+fpm_socket="/run/php${phpver}/${username}_${domain}-fpm.sock"
+tmp_dir="/var/www/${username}/tmp";
+zone_file="${zone_dir}/${domain}.db"
+domain_dot="${domain%.}."
+
+# Step 8: SSL Setup
+if [[ "$ssl_option" == "Self-Signed" ]]; then
+    mkdir -p "$ssl_dir"
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout "$ssl_dir/$domain.key" \
+        -out "$ssl_dir/$domain.crt" \
+        -subj "/C=IN/ST=NA/L=NA/O=Neoistone/OU=Hostingaro/CN=$domain"
+    ssl_block="ssl_certificate $ssl_dir/$domain.crt;
+    ssl_certificate_key $ssl_dir/$domain.key;
+    "
+elif [[ "$ssl_option" == "Certbot (Let's Encrypt)" ]]; then
+    systemctl stop nginx
+    certbot certonly --standalone -d "$domain" -d "www.${domain}" --email "webmaster@${domain}.com" --agree-tos
+
+    ssl_block="ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
+    "
+fi
+
+# Step 9: Generate Nginx config for the selected IP
+cat <<EOF > "$conf_file"
+server {
+    listen ${ip}:80;
+    server_name ${domain} www.${domain};
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen ${ip}:443 ssl http2;
+    server_name ${domain} www.${domain};
+
+    root ${root};
+    index index.php index.html;
+
+    access_log /var/log/nginx/${domain}_${username}_access.log;
+    error_log /var/log/nginx/${domain}_${username}_error.log;
+
+    ${ssl_block}
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$args;
+    }
+
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|webp|woff|woff2|ttf|eot|otf|mp4|webm)$ {
+        expires max;
+        access_log off;
+        log_not_found off;
+    }
+
+    location ~ /\. {
+        deny all;
+    }
+
+    location /cgi-bin/ {
+        root ${root};
+        gzip off;
+        fastcgi_pass unix:/var/opt/remi/php${phpver}/run/php-fpm.sock;
+        include fastcgi_params;
+    }
+
+    location ~ \.php$ {
+        include fastcgi_params;
+        fastcgi_pass unix:${fpm_socket};
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param PATH_INFO \$fastcgi_path_info;
+        fastcgi_read_timeout 7200s;
+    }
+
+}
+EOF
+
+cat <<EOF > "$fpm_file"
+[${username}_${domain}]
+user = ${username}
+group = ${username}
+
+listen = ${fpm_socket}
+listen.owner = nginx
+listen.group = nginx
+listen.mode = 0660
+
+pm = ondemand
+pm.max_children = 3
+pm.start_servers = 1
+pm.min_spare_servers = 1
+pm.max_spare_servers = 2
+pm.process_idle_timeout = 10s
+pm.max_requests = 500
+
+chdir = /
+
+php_admin_value[disable_functions] = exec,passthru,shell_exec,system,proc_open,popen,curl_exec,curl_multi_exec,show_source
+php_admin_value[error_log] = ${log_dir}/${username}_${domain}-fpm.log
+php_admin_value[session.save_path] = ${tmp_dir}
+php_admin_value[upload_tmp_dir] = ${tmp_dir}
+php_admin_value[max_execution_time] = 300s;
+php_admin_value[memory_limit] = 256M
+EOF
+
+if [ ! -d "/var/run/php${phpver}" ]; then
+    mkdir "/var/run/php${phpver}"
+    chown -R php-fpm:php-fpm "/var/run/php${phpver}"
+fi
+
+
+if grep -q "zone \"${domain}\"" "$named_conf"; then
+    echo "Zone already exists for $domain"
+    exit 1
+fi
+
+cat > "$zone_file" <<EOF
+\$TTL 86400
+${domain_dot}   IN  SOA ns1.${domain_dot} admin.${domain_dot} (
+        $(date +%s) ; Serial
+        3600       ; Refresh
+        1800       ; Retry
+        1209600    ; Expire
+        86400 )    ; Minimum
+
+    IN  NS      ns1.${domain_dot}
+    IN  NS      ns2.${domain_dot}
+
+ns1             IN     A       ${public_ip}
+ns2             IN     A       ${public_ip}
+${domain_dot}   IN     A       ${public_ip}
+mail            IN     A       ${public_ip}
+
+www             IN     CNAME        ${domain_dot}
+
+${domain_dot}   IN     MX 0        mail.${domain_dot}
+${domain_dot}   IN     MX 10        mail.${domain_dot}
+
+_dmarc          IN     TXT "v=DMARC1;p=reject;sp=reject;pct=100;rua=mailto:webmaster@${domain};ruf=mailto:webmaster@${domain};ri=86400;aspf=s;adkim=s;fo=1;"
+${domain_dot}   IN     TXT "v=spf1 ip4:${public_ip} ~all"
+EOF
+
+chown root:named "$zone_file"
+chmod 640 "$zone_file"
+
+echo "Zone file created at: $zone_file"
+
+cat >> "$named_conf" <<EOF
+
+zone "${domain}" IN {
+     type master;
+     file "${zone_file}";
+     allow-transfer { none; };
+     allow-update { key certbot.; };
+};
+EOF
+
+
+
+# Step 10: Reload Nginx to apply the new vhost
+nginx -t && systemctl restart "php${phpver}-php-fpm" nginx named
+
+echo "|-------------------------------------------"
+echo "|                                           "
+echo "| ✅ LIVE: https://$domain under $username 🔥"
+echo "|"
+echo "| User         : ${username}"
+echo "| Website      : https://${domain} and https://www.${domain}"
+echo "| Php version  : php-${phpver}"
+echo "| privated ip  : ${ip}"
+echo "| public ip    : ${public_ip}"
+echo "|                                           "
+echo "|-------------------------------------------"
